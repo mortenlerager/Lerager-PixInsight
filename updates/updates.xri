@@ -1,13 +1,13 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='utf-8'?>
 <xri version="1.0">
    <description>
       <p>PixInsight scripts by Morten Lerager: AstroClean and AlignRGB Preview.</p>
    </description>
    <platform os="all" arch="noarch" version="1.9.6:2.99.99">
-      <package fileName="Lerager-Scripts-20261122.zip" sha1="93ed2537623e5e372cda50c8a15d6ec789436060" type="script" releaseDate="20261122">
-         <title>Lerager Scripts - AstroClean 2.6.8 / AlignRGB Preview 0.3</title>
+      <package fileName="Lerager-Scripts-20261126-v287.zip" sha1="15b93aaf96bad2db402949cc32ed9ec95c7bd70e" type="script" releaseDate="20261126">
+         <title>Lerager Scripts - AstroClean 2.8.7 / AlignRGB Preview 0.3</title>
          <description>
-            <p>Installs AstroClean and AlignRGB Preview under Script &gt; Lerager.</p>
+            <p>Installs AstroClean 2.8.7 with English documentation and TPS Local Remove, and AlignRGB Preview 0.3 under Script &gt; Lerager.</p>
          </description>
       </package>
    </platform>

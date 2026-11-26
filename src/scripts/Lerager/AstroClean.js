@@ -1,11 +1,20 @@
 #engine v8
 #feature-id Lerager > AstroClean
-#feature-info AstroClean v2.6.8 experimental. Correct a linear image with a synthetic flat estimated from its starless counterpart.
+#feature-info AstroClean v2.8.7. Correct a linear image with a synthetic flat estimated from its starless counterpart.
 
 #include <pjsr/StdButton.jsh>
 #include <pjsr/StdIcon.jsh>
 
 "use strict";
+
+const AC_DEBUG_MASK = false; // Development build: false disables diagnostic images.
+function acSpinner(label) {
+   let phase=0;
+   const timer=new Timer;timer.interval=0.12;timer.periodic=true;
+   timer.onTimeout=()=>{label.text=["|","/","—","\\"][phase++%4]+"  "+label.text.replace(/^.  /, "");};
+   timer.start();return timer;
+}
+const AC_FLAT_FACTOR = 4; // Internal only: 4=25%, 2=50%, 1=100%.
 
 function acSelect(values, k, length = values.length) {
    let lo = 0, hi = length - 1;
@@ -86,6 +95,7 @@ function acHalf(src, w, h) {
 }
 
 function acUpsample(src, w, h, width, height, binary = false) {
+   if(w===width && h===height) return src;
    const out = binary ? new Uint8Array(width*height) : new Float32Array(width*height);
    const sx = (w-1)/(width-1), sy = (h-1)/(height-1);
    for (let y = 0; y < height; ++y) {
@@ -181,24 +191,102 @@ function acDilate(mask,w,h,r) {
    return result;
 }
 
-function acMask(fine,fw,fh,tick) {
+// Reject complete dark candidates and dark peripheral lobes, not individual pixels.
+function acRejectDarkObjects(coarse,core,small,w,h,tick) {
+   const local=acFilter(coarse,w,h,8,true,tick);
+   const delta=coarse.map((v,i)=>v-local[i]);
+   const [dm,ds]=acStats(delta);
+   const dark=new Uint8Array(coarse.length);
+   acComponents(Uint8Array.from(delta,v=>v<Math.min(0,dm-3*ds)?1:0),w,h,component=>{
+      if(component.length<3 || component.length>500) return;
+      // Preserve dark structures embedded in the detected bright object core.
+      if(component.some(i=>core[i])) return;
+      for(const i of component) dark[i]=1;
+   });
+   
+   const accepted=new Uint8Array(small.length);
+   acComponents(small,w,h,component=>{
+      const footprint=new Set(), ring=new Set();
+      for(const p of component){
+         const x=p%w,y=Math.floor(p/w);
+         for(let dy=-12;dy<=12;++dy) for(let dx=-12;dx<=12;++dx){
+            const d=dx*dx+dy*dy;
+            if(d>144 || x+dx<0 || x+dx>=w || y+dy<0 || y+dy>=h) continue;
+            const i=p+dy*w+dx;
+            if(d<=16) footprint.add(i); else if(d>=64) ring.add(i);
+         }
+      }
+      const sky=Array.from(ring).filter(i=>!footprint.has(i)&&!core[i]).map(i=>coarse[i]);
+      if(!sky.length) return;
+      const baseline=acMedian(sky);
+      const values=Array.from(footprint).map(i=>coarse[i]);
+      let negative=0,positive=0;
+      for(const i of footprint){
+         if(delta[i]<Math.min(0,dm-2.5*ds)) ++negative;
+         if(delta[i]>Math.max(0,dm+2.5*ds)) ++positive;
+      }
+      if(acMedian(values)>=baseline && positive>negative && !Array.from(footprint).some(i=>dark[i]))
+         for(const i of component) accepted[i]=1;
+   });
+   const expanded=acDilate(core,w,h,8);
+   const compact=acDilate(accepted,w,h,4);
+   // Preserve continuous masks: do not carve dark holes after dilation.
+   return Uint8Array.from(expanded,(v,i)=>v || compact[i] ? 1:0);
+}
+
+// Diagnostic background: lower-quartile tile estimates, smoothed on a sparse grid.
+function acDiagnosticBackground(src,w,h,tick) {
+   const nx=Math.max(2,Math.min(8,Math.floor(w/32)));
+   const ny=Math.max(2,Math.min(8,Math.floor(h/32)));
+   const grid=new Float32Array(nx*ny);
+   for(let gy=0;gy<ny;++gy) {
+      tick();
+      for(let gx=0;gx<nx;++gx) {
+         const values=[];
+         const x0=Math.floor(gx*w/nx),x1=Math.floor((gx+1)*w/nx);
+         const y0=Math.floor(gy*h/ny),y1=Math.floor((gy+1)*h/ny);
+         for(let y=y0;y<y1;++y) for(let x=x0;x<x1;++x) values.push(src[y*w+x]);
+         grid[gy*nx+gx]=acSelect(values,Math.floor(values.length*0.25));
+      }
+   }
+   // Suppress bright contaminated tiles using a neighborhood lower quartile.
+   const clean=grid.map((v,i)=>{
+      const x=i%nx,y=Math.floor(i/nx),a=[];
+      for(let yy=Math.max(0,y-1);yy<=Math.min(ny-1,y+1);++yy)
+         for(let xx=Math.max(0,x-1);xx<=Math.min(nx-1,x+1);++xx) a.push(grid[yy*nx+xx]);
+      return Math.min(v,acSelect(a,Math.floor(a.length*0.25)));
+   });
+   return acUpsample(acFilter(clean,nx,ny,1,false,tick),nx,ny,w,h);
+}
+
+function acMask(fine,fw,fh,tick,sensitivity=50,debug=AC_DEBUG_MASK) {
+   const high=Math.max(0,(sensitivity-50)/50);
+   const k=Math.pow(2,(50-sensitivity)/50-2*high);
    const w = fw >> 1, h = fh >> 1;
    const coarse = acHalf(fine,fw,fh);
    const levels = acPyramid(coarse,w,h,6,tick);
    const extended = levels[2].map((v,i) => v-levels[5][i]);
    const broad = levels[3].map((v,i) => v-levels[6][i]);
    const [em,es] = acStats(extended), [bm,bs] = acStats(broad);
-   const support = Uint8Array.from(extended,(v,i) => v > em+1.75*es || broad[i] > bm+2.8*bs);
+   // Require corroboration at the smaller scale before broad-scale growth.
+   // Broad residuals alone can connect dust-shadow halos to a bright galaxy.
+   const support = Uint8Array.from(extended,(v,i) =>
+      v > em+3.5*es*k || (v > em+2.5*es*k && broad[i] > bm+2.8*bs*k) ||
+      (high>0 && v > em+(2.5-2.5*high)*es*k && broad[i] > bm+(5-3*high)*bs*k));
    const seeds = new Uint8Array(coarse.length);
-   acComponents(Uint8Array.from(extended,v => v > em+10*es),w,h,component => {
-      if (component.length >= 50 && component.some(i => extended[i] > 18*es))
+   acComponents(Uint8Array.from(extended,v => v > em+10*es*k),w,h,component => {
+      if (component.length >= 50 && component.some(i => extended[i] > 18*es*k))
          for (const i of component) seeds[i] = 1;
    });
-   const grown = acFlood(seeds,support,w,h);
+   const alt=acDiagnosticBackground(coarse,w,h,tick);
+   const signal=levels[2].map((v,i)=>v-alt[i]);
+   const [am,as]=acStats(signal);
+   const altSupport=Uint8Array.from(signal,v=>v>am+3.5*as*k);
+   const grown=acFlood(seeds,altSupport,w,h);
    const open = grown.map(v => 1-v);
    const boundary = open.map((v,i) => v && (i < w || i >= w*(h-1) || i%w === 0 || i%w === w-1));
    const closed = acFlood(boundary,open,w,h).map(v => 1-v);
-   const large = acDilate(closed,w,h,18);
+   const large = acDilate(closed,w,h,8);
 
    const smooth = acFilter(fine,fw,fh,1,false,tick);
    const fineMedian = acFilter(smooth,fw,fh,5,true,tick);
@@ -216,7 +304,41 @@ function acMask(fine,fw,fh,tick) {
           component.some(i => narrow[i] >= nm+5*ns))
          for (const i of component) small[i] = 1;
    });
-   return acDilate(small,w,h,7).map((v,i) => v || large[i]);
+   const finalMask = acRejectDarkObjects(coarse,closed,small,w,h,tick);
+   // Diagnostic only: export each stage at the original mask grid resolution.
+   // Signed residuals: zero relative to the robust median is mid-gray.
+   // Use the same sigma-relative display range for both residual displays, without changing detection.
+   const residualDisplay=(data,median,sigma)=>Float32Array.from(data,v=>Math.max(0,Math.min(1,0.5+(v-median)/(40*sigma))));
+   const stages = [];
+   if (debug) {
+      const [bgm,bgs]=acStats(levels[5]);
+      stages.push(["01_OriginalFlood",acFlood(seeds,support,w,h)],
+                  ["02_AlternativeBackground",residualDisplay(alt,bgm,bgs)],
+                  ["03_AlternativeSignal",residualDisplay(signal,am,as)],
+                  ["04_AlternativeSupport",altSupport],
+                  ["05_AlternativeFlood",grown]);
+
+   }
+   if (debug) {
+      // Replace previous diagnostic windows only; never touch source or result views.
+      for (const win of ImageWindow.windows.slice())
+         if (/^AC_Mask_(?:S\d+_)?\d{2}_(?:Seeds|Flood|Closed|Dilated|SmallCandidates|Final|Background_L5|Extended_L2_L5|Broad_L3_L6|Background_L6|FloodSupport|AlternativeBackground|AlternativeSignal|AlternativeSupport|AlternativeFlood|OriginalFlood)(?:_\d+)?$/.test(win.mainView.id))
+            win.forceClose();
+   }
+   if (debug) for (const [name, data] of stages) {
+      tick();
+      const window = acCreateOutput("AC_Mask_S"+sensitivity+"_"+name,w,h,1);
+      try {
+         acEditOutput(window,image=>{
+            for(let y=0;y<h;y+=64) {
+               const rows=Math.min(64,h-y);
+               acWriteRows(image,y,rows,0,Float32Array.from(data.subarray(y*w,(y+rows)*w)));
+            }
+         });
+         window.show();
+      } catch(e) {window.forceClose();throw e;}
+   }
+   return finalMask;
 }
 
 function acReconstruct(plane,mask,w,h,tick) {
@@ -411,6 +533,156 @@ function acLocalFill(plane,mask,w,h,regions,tick,sourceExclusion=mask) {
    return result;
 }
 
+function acAlternativeFill(plane,mask,w,h,regions,tick,sourceExclusion=mask) {
+   const labels = new Int32Array(mask.length).fill(-1), objects=[];
+   acComponents(mask,w,h,indices => {
+      const id=objects.length;
+      let x0=w,y0=h,x1=0,y1=0;
+      for(const p of indices) {
+         labels[p]=id;
+         const x=p%w,y=Math.floor(p/w);
+         x0=Math.min(x0,x); x1=Math.max(x1,x);
+         y0=Math.min(y0,y); y1=Math.max(y1,y);
+      }
+      objects.push({x0,y0,x1,y1,regions:[]});
+   });
+   if(!objects.length) return plane.slice();
+   // Associate each manual source with the nearest object boundary.
+   for(const region of (regions || [])) {
+      let best=-1,dBest=Infinity;
+      for(let id=0;id<objects.length;++id) {
+         const o=objects[id]; let d=Infinity;
+         for(let p=0;p<region.length;++p) if(region[p] && !mask[p]) {
+            const x=p%w,y=Math.floor(p/w);
+            const dx=Math.max(o.x0-x,0,x-o.x1),dy=Math.max(o.y0-y,0,y-o.y1);
+            d=Math.min(d,dx*dx+dy*dy);
+         }
+         if(d<dBest) {dBest=d;best=id;}
+      }
+      if(best>=0) objects[best].regions.push(region);
+   }
+   // Keep automatic donor tiles away from the mask's potentially contaminated edge.
+   const excluded=sourceExclusion.slice();
+   let edge=sourceExclusion.slice();
+   for(let k=0;k<8;++k) {
+      const next=new Uint8Array(mask.length);
+      for(let p=0;p<edge.length;++p) if(edge[p])
+         acNeighbors(p,w,h,true,q=>{if(!excluded[q]){excluded[q]=1;next[q]=1;}});
+      edge=next;
+   }
+   function donors(allowed,manual) {
+      const points=[],step=12;
+      for(let y0=0;y0<h;y0+=step) {
+         if(y0%48===0) tick('Measuring clean background');
+         for(let x0=0;x0<w;x0+=step) {
+            const values=[];let sx=0,sy=0;
+            for(let y=y0;y<Math.min(h,y0+step);++y)
+               for(let x=x0;x<Math.min(w,x0+step);++x) {
+                  const p=y*w+x;
+                  if(!sourceExclusion[p] && (manual ? allowed[p] : !excluded[p]) && isFinite(plane[p])) {
+                     values.push(plane[p]);sx+=x;sy+=y;
+                  }
+               }
+            if(values.length>=9) points.push([sx/values.length,sy/values.length,acMedian(values)]);
+         }
+      }
+      return points;
+   }
+   // Regularized thin plate spline, with bounded spatially distributed donors.
+   function model(points,o) {
+      const cx=(o.x0+o.x1)/2,cy=(o.y0+o.y1)/2;
+      const scale=Math.max(24,(o.x1-o.x0)/2,(o.y1-o.y0)/2);
+      const hx=(o.x1-o.x0)/2/scale,hy=(o.y1-o.y0)/2/scale;
+      const distance=p=>Math.hypot(Math.max(0,Math.abs(p[0])-hx),Math.max(0,Math.abs(p[1])-hy));
+      let samples=points.map(p=>[(p[0]-cx)/scale,(p[1]-cy)/scale,p[2]]);
+      samples.sort((a,b)=>distance(a)-distance(b));
+      if(!o.regions.length) {
+         const radius=Math.max(0.45,distance(samples[Math.min(95,samples.length-1)]));
+         samples=samples.filter(p=>distance(p)<=radius);
+      }
+      // Aggregate nearby tile medians into spatial bins, not just nearest points.
+      let cell=0.12, nodes=[];
+      do {
+         const bins=new Map();
+         for(const p of samples) {
+            const key=Math.floor(p[0]/cell)+','+Math.floor(p[1]/cell);
+            if(!bins.has(key)) bins.set(key,[]);
+            bins.get(key).push(p);
+         }
+         nodes=Array.from(bins.values(),v=>[acMedian(v.map(p=>p[0])),acMedian(v.map(p=>p[1])),acMedian(v.map(p=>p[2]))]);
+         cell*=1.4;
+      } while(nodes.length>96);
+      const n=nodes.length, base=acMedian(nodes.map(p=>p[2]));
+      const kernel=r2=>r2>1e-20?0.5*r2*Math.log(r2):0;
+      function solve(weights) {
+         const m=Array.from({length:n+3},()=>new Float64Array(n+4));
+         for(let i=0;i<n;++i) {
+            for(let j=0;j<n;++j) {const dx=nodes[i][0]-nodes[j][0],dy=nodes[i][1]-nodes[j][1];m[i][j]=kernel(dx*dx+dy*dy);}
+            m[i][i]+=0.035/weights[i];
+            m[i][n]=m[n][i]=1;m[i][n+1]=m[n+1][i]=nodes[i][0];m[i][n+2]=m[n+2][i]=nodes[i][1];
+            m[i][n+3]=nodes[i][2]-base;
+         }
+         for(let j=0;j<n+3;++j) {
+            let k=j;for(let i=j+1;i<n+3;++i)if(Math.abs(m[i][j])>Math.abs(m[k][j]))k=i;
+            [m[j],m[k]]=[m[k],m[j]];const d=m[j][j];if(Math.abs(d)<1e-12)return null;
+            for(let l=j;l<n+4;++l)m[j][l]/=d;
+            for(let i=0;i<n+3;++i)if(i!==j){const t=m[i][j];for(let l=j;l<n+4;++l)m[i][l]-=t*m[j][l];}
+         }
+         return m.map(row=>row[n+3]);
+      }
+      function evalAt(beta,x,y) {
+         let v=base+beta[n]+beta[n+1]*x+beta[n+2]*y;
+         for(let i=0;i<n;++i){const dx=x-nodes[i][0],dy=y-nodes[i][1];v+=beta[i]*kernel(dx*dx+dy*dy);}
+         return v;
+      }
+      let weights=new Float64Array(n).fill(1),beta=null;
+      if(n>=3)for(let iter=0;iter<4;++iter) {
+         const next=solve(weights);if(!next)break;beta=next;
+         const residual=nodes.map(p=>p[2]-evalAt(beta,p[0],p[1]));
+         const med=acMedian(residual.slice()),sigma=Math.max(1e-12,1.4826*acMedian(residual.map(v=>Math.abs(v-med))));
+         for(let i=0;i<n;++i)weights[i]=Math.max(0.03,1/Math.max(1,Math.abs(residual[i]-med)/(2.5*sigma)));
+      }
+      // Evaluate on a small grid and bilinearly interpolate for large masks.
+      const step=Math.max(1,Math.ceil(Math.max(o.x1-o.x0,o.y1-o.y0)/160));
+      const gw=Math.ceil((o.x1-o.x0)/step)+2,gh=Math.ceil((o.y1-o.y0)/step)+2;
+      const grid=new Float64Array(gw*gh);
+      for(let j=0;j<gh;++j)for(let i=0;i<gw;++i) {
+         const v=beta?evalAt(beta,(o.x0+i*step-cx)/scale,(o.y0+j*step-cy)/scale):base;
+         grid[j*gw+i]=Number.isFinite(v)?Math.max(1e-12,v):Math.max(1e-12,base);
+      }
+      return (x,y)=>{const u=(x-o.x0)/step,v=(y-o.y0)/step,i=Math.floor(u),j=Math.floor(v),a=u-i,b=v-j,k=j*gw+i;return (1-b)*((1-a)*grid[k]+a*grid[k+1])+b*((1-a)*grid[k+gw]+a*grid[k+gw+1]);};
+   }
+   let automatic=null;
+   const trees=objects.map(o=>{
+      if(o.regions.length) {
+         const allowed=new Uint8Array(mask.length);
+         for(const region of o.regions) for(let p=0;p<mask.length;++p) allowed[p]|=region[p];
+         const samples=donors(allowed,true);
+         if(!samples.length) throw new Error('Background source is too small. Enlarge its lasso.');
+         return model(samples,o);
+      }
+      if(!automatic) {
+         const samples=donors(null,false);
+         if(!samples.length) throw new Error('Not enough clear background. Mark a source outside the object mask.');
+         automatic=samples;
+      }
+      return model(automatic,o);
+   });
+   const result=plane.slice();
+   // Small spatial blocks limit working memory. There is no copied texture and
+   // no feather containing the original galaxy light inside the object mask.
+   for(let by=0;by<h;by+=16) {
+      tick('Filling object areas — '+Math.round(100*by/h)+'%');
+      for(let bx=0;bx<w;bx+=16)
+         for(let y=by;y<Math.min(by+16,h);++y)
+            for(let x=bx;x<Math.min(bx+16,w);++x) {
+               const p=y*w+x;
+               if(mask[p]) result[p]=trees[labels[p]](x,y);
+            }
+   }
+   return result;
+}
+
 function acMMTResidual(plane,w,h,tick,detailCount=2) {
    if(!Number.isInteger(detailCount) || detailCount<1 || detailCount>6) throw new Error("MMT layers must be 1–6.");
    if(typeof MultiscaleMedianTransform === "undefined")
@@ -456,9 +728,9 @@ function acMMTResidual(plane,w,h,tick,detailCount=2) {
 
 // Optional smoothing of the rebuilt flat only, in a narrow band on both sides
 // of the object boundary. The binary protection mask is never blurred.
-function acSoftenBoundary(rebuilt,mask,w,h,pixels,tick) {
+function acSoftenBoundary(rebuilt,mask,w,h,pixels,tick,factor=AC_FLAT_FACTOR) {
    if(!(pixels>0)) return rebuilt;
-   const band=Math.max(1,Math.ceil(pixels/4));
+   const band=Math.max(1,Math.ceil(pixels/factor));
    const dist=new Int32Array(mask.length).fill(-1),queue=new Int32Array(mask.length);
    let tail=0;
    for(let p=0;p<mask.length;++p) {
@@ -490,14 +762,14 @@ function acSoftenBoundary(rebuilt,mask,w,h,pixels,tick) {
    return out;
 }
 
-function acFlat(plane,mask,w,h,tick,regions,detailCount=2,edgePixels=0) {
+function acFlat(plane,mask,w,h,tick,regions,detailCount=2,edgePixels=0,factor=AC_FLAT_FACTOR) {
    const rebuilt=acLocalFill(plane,mask,w,h,regions,tick);
-   return acMMTResidual(acSoftenBoundary(rebuilt,mask,w,h,edgePixels,tick),w,h,tick,detailCount);
+   return acMMTResidual(acSoftenBoundary(rebuilt,mask,w,h,edgePixels,tick,factor),w,h,tick,detailCount);
 }
 
 // Local additive repair: estimate background on starless data, transfer only
 // its smooth difference to the matching image with stars. No flat division.
-function acRemoveLocal(original,starless,latest,target,protection,w,h,regions,tick) {
+function acRemoveLocal(original,starless,latest,target,protection,w,h,regions,tick,outputName="AstroClean_Removed") {
    if(!target.some(v=>v)) throw new Error("Draw a lasso around the image feature to remove.");
    const W=original.image.width,H=original.image.height;
    let planes;
@@ -506,8 +778,9 @@ function acRemoveLocal(original,starless,latest,target,protection,w,h,regions,ti
       planes=acDownsampleImage(starless.image,4,false,tick);
       if(latest && latest.flats) {
          for(let c=0;c<planes.length;++c) {
-            const norm=acMedian(acUpsample(latest.flats[c],w,h,W,H));
-            for(let p=0;p<planes[c].length;++p) planes[c][p]*=norm/latest.flats[c][p];
+            const norm=acMedian(acUpsample(latest.flats[c],latest.flatW || w,latest.flatH || h,W,H));
+            const smallFlat=acUpsample(latest.flats[c],latest.flatW || w,latest.flatH || h,w,h);
+            for(let p=0;p<planes[c].length;++p) planes[c][p]*=norm/smallFlat[p];
          }
       }
    }
@@ -528,7 +801,7 @@ function acRemoveLocal(original,starless,latest,target,protection,w,h,regions,ti
    }
    const differences=planes.map((plane,c)=>{
       tick("Local Remove — channel "+(c+1));
-      const filled=acLocalFill(plane,target,w,h,regions,tick,excluded);
+      const filled=acAlternativeFill(plane,target,w,h,regions,tick,excluded);
       const delta=new Float32Array(plane.length);
       for(let p=0;p<plane.length;++p) if(target[p]) {
          let t=Math.min(1,Math.max(0,(distance[p]-1)/4));t=t*t*(3-2*t);
@@ -537,7 +810,7 @@ function acRemoveLocal(original,starless,latest,target,protection,w,h,regions,ti
       }
       return delta;
    });
-   const output=acCreateOutput("AstroClean_Removed",W,H,planes.length);
+   const output=acCreateOutput(outputName,W,H,planes.length);
    try {
       const input=latest ? latest.corrected.image : original.image;
       acEditOutput(output,image=>{
@@ -558,7 +831,7 @@ function acRemoveLocal(original,starless,latest,target,protection,w,h,regions,ti
       if(typeof output.copyAstrometricSolution==="function") output.copyAstrometricSolution(original.window);
       output.mainView.stf=original.stf;
       return {mask:protection,flats:null,w,h,window:output,corrected:output.mainView,
-         repairPlanes:planes,isRemoval:true,baseFlats:latest ? (latest.flats || latest.baseFlats) : null};
+         repairPlanes:planes,repairDifferences:differences,repairTarget:target,isRemoval:true,flatW:latest && (latest.flatW || latest.w),flatH:latest && (latest.flatH || latest.h),baseMask:latest ? (latest.flats ? latest.mask : latest.baseMask) : null,baseW:latest ? (latest.flats ? latest.w : latest.baseW) : null,baseH:latest ? (latest.flats ? latest.h : latest.baseH) : null,baseFlats:latest ? (latest.flats || latest.baseFlats) : null};
    } catch(e) {output.forceClose();throw e;}
 }
 
@@ -655,7 +928,7 @@ function acEditOutput(window,write) {
    }
 }
 
-function acShowIntermediates(result) {
+function acShowIntermediates(result,stem) {
    if(!result.flats || result.externalFlat) return;
    const W = result.corrected.image.width, H = result.corrected.image.height;
    const created = [];
@@ -664,7 +937,7 @@ function acShowIntermediates(result) {
       created.push(window);
       acEditOutput(window,image => {
          for (let c = 0; c < count; ++c) {
-            const plane = acUpsample(planeAt(c),result.w,result.h,W,H,binary);
+            const plane = acUpsample(planeAt(c),binary ? result.w : (result.flatW || result.w),binary ? result.h : (result.flatH || result.h),W,H,binary);
             for (let y = 0; y < H; y += 64) {
                const rows = Math.min(64,H-y);
                const block = plane.subarray(y*W,(y+rows)*W);
@@ -675,8 +948,8 @@ function acShowIntermediates(result) {
       return window;
    }
    try {
-      const mask = output("AstroClean_Mask",1,true,() => result.mask);
-      const flat = output("AstroClean_SyntheticFlat",result.flats.length,false,c => result.flats[c]);
+      const mask = output(stem+"_Mask",1,true,() => result.mask);
+      const flat = output(stem+"_SyntheticFlat",result.flats.length,false,c => result.flats[c]);
       mask.show();
       flat.show();
    } catch (error) {
@@ -755,6 +1028,8 @@ function acValidateInputs(original,starless) {
 }
 
 function acRun(original,starless,editRequest) {
+   const factor=editRequest && editRequest.factor || AC_FLAT_FACTOR;
+   let aborted=false;
    const progress = new Dialog;
    progress.windowTitle = "AstroClean — Working";
    const progressText = new Label(progress);
@@ -763,6 +1038,9 @@ function acRun(original,starless,editRequest) {
    progress.sizer = new VerticalSizer;
    progress.sizer.margin = 14;
    progress.sizer.add(progressText);
+   const abortButton=new PushButton(progress);abortButton.text="Abort";
+   abortButton.onClick=()=>{aborted=true;abortButton.enabled=false;};
+   progress.sizer.add(abortButton);
    progress.adjustToContents();
    const input = original.image, background = starless.image;
    const W = input.width, H = input.height;
@@ -774,12 +1052,13 @@ function acRun(original,starless,editRequest) {
       if (text) stage = text;
       progressText.text = ["◐","◓","◑","◒"][pulse++ % 4] + "  " + channelStatus + stage;
       processEvents();
-      if (console.abortRequested) throw new Error("AstroClean was cancelled.");
+      if (aborted || console.abortRequested) throw new Error("AstroClean was cancelled.");
    };
    console.abortEnabled = true;
    progress.show();
+   const spinner=acSpinner(progressText);
    try {
-      console.writeln("<b>AstroClean v2.6.8 experimental</b> — object mask");
+      console.writeln("<b>AstroClean v2.8.7</b> — object mask");
       let mask;
       if (editRequest && editRequest.preparedMask) {
          mask = editRequest.preparedMask;
@@ -794,12 +1073,15 @@ function acRun(original,starless,editRequest) {
       }
       const maskCount = mask.reduce((total,v) => total+v,0);
       console.writeln("Masked area: " + (100*maskCount/mask.length).toFixed(2) + "%");
-      const planes = acDownsampleImage(background,4,false,tick);
+      const flatW=Math.floor(W/factor), flatH=Math.floor(H/factor);
+      const fullMask=factor===4 ? mask : acUpsample(mask,w,h,flatW,flatH,true);
+      const fullRegions=(editRequest && editRequest.regions || []).map(region=>factor===4 ? region : acUpsample(region,w,h,flatW,flatH,true));
+      const planes=acDownsampleImage(background,factor,false,tick);
       const flats = planes.map((plane,c) => {
          channelStatus = "Channel " + (c+1) + "/" + channels + " — ";
-         tick("Preparing background");
-         console.writeln("Reconstructing background, channel " + (c+1));
-         return acFlat(plane,mask,w,h,tick,editRequest && editRequest.regions,editRequest && editRequest.mmtLayers || 2,editRequest && editRequest.edgePixels || 0);
+         tick("Preparing TPS background");
+         const rebuilt=acAlternativeFill(plane,fullMask,flatW,flatH,fullRegions,tick);
+         return acMMTResidual(acSoftenBoundary(rebuilt,fullMask,flatW,flatH,editRequest && editRequest.edgePixels || 0,tick,factor),flatW,flatH,tick,editRequest && editRequest.mmtLayers || 2);
       });
       if (flats.some(flat => flat.some(v => !Number.isFinite(v) || v <= 0)))
          throw new Error("The synthetic flat contains nonpositive or non-finite samples.");
@@ -811,7 +1093,7 @@ function acRun(original,starless,editRequest) {
             channelStatus = "Channel " + (c+1) + "/" + channels + " — ";
             tick("Applying synthetic flat");
             console.writeln("Applying flat, channel " + (c+1));
-            const fullFlat = acUpsample(flats[c],w,h,W,H);
+            const fullFlat = acUpsample(flats[c],flatW,flatH,W,H);
             const normalization = acMedian(fullFlat);
             for (let y = 0; y < H; y += 64) {
                tick();
@@ -829,12 +1111,12 @@ function acRun(original,starless,editRequest) {
          corrected.copyAstrometricSolution(original.window);
       corrected.mainView.stf = original.stf;
       console.writeln("Done.");
-      return {mask,flats,w,h,corrected:corrected.mainView,window:corrected,isRemoval:false,edgePixels:editRequest && editRequest.edgePixels || 0,mmtLayers:editRequest && editRequest.mmtLayers || 2,sourceRegions:editRequest && editRequest.regions};
+      return {mask,flats,w,h,flatW,flatH,factor,corrected:corrected.mainView,window:corrected,isRemoval:false,edgePixels:editRequest && editRequest.edgePixels || 0,mmtLayers:editRequest && editRequest.mmtLayers || 2,sourceRegions:editRequest && editRequest.regions};
    } catch (error) {
       created.reverse().forEach(window => window.forceClose());
       throw error;
    } finally {
-      progress.hide();
+      spinner.stop();progress.hide();
       console.abortEnabled = false;
    }
 }
@@ -886,7 +1168,7 @@ function acCorrectedStarlessPreview(original,starless,result,width,height,factor
    const channels=starless.image.isColor ? 3:1;
    const planes=[];
    for(let c=0;c<channels;++c) {
-      const flat=flats ? acUpsample(flats[c],result.w,result.h,W,H) : null;
+      const flat=flats ? acUpsample(flats[c],result.flatW || result.w,result.flatH || result.h,W,H) : null;
       const norm=flat ? acMedian(flat):1;
       const small=new Float32Array(w*h);
       for(let y=0;y<h;++y) {
@@ -917,73 +1199,39 @@ function acEditorStretch(planes) {
    return planes.map(plane => {
       const [median,sigma] = acStats(plane);
       const black = median-2.8*sigma;
-      return (value,gain) => {
+      return (value,gain,highlight=1) => {
          const scaled = gain*Math.max(0,(value-black)/sigma);
-         return Math.round(255*Math.min(1,Math.asinh(scaled/3)/Math.asinh(25)));
+         const knee=3;
+         const z=scaled/knee;
+         const t=Math.asinh(z);
+         const anchor=Math.asinh(1);
+         const u=t<=anchor?t:anchor+highlight*(t-anchor);
+         return Math.round(255*Math.min(1,u/(u+Math.asinh(25)-anchor)));
       };
    });
 }
 
-function acEditorBitmap(planes,stretch,width,height,overlay,gain = 1) {
+function acEditorBitmap(planes,stretch,width,height,overlay,gain = 1,highlight=1) {
    const bitmap = new Bitmap(width,height);
    for (let y = 0; y < height; ++y) {
       for (let x = 0; x < width; ++x) {
          const i = y*width+x;
-         let r = stretch[0](planes[0][i],gain);
+         let r = stretch[0](planes[0][i],gain,highlight);
          let g = r, b = r;
          if (planes.length === 3) {
-            g = stretch[1](planes[1][i],gain);
-            b = stretch[2](planes[2][i],gain);
+            g = stretch[1](planes[1][i],gain,highlight);
+            b = stretch[2](planes[2][i],gain,highlight);
          }
          if (overlay && overlay[i]) {
-            r = Math.round(0.56*r+20);
-            g = Math.round(0.56*g+112);
-            b = Math.round(0.56*b+48);
+            const a=overlay[i];
+            r = Math.round((1-0.44*a)*r+20*a);
+            g = Math.round((1-0.44*a)*g+112*a);
+            b = Math.round((1-0.44*a)*b+48*a);
          }
          bitmap.setPixel(x,y,(0xff000000 | (r<<16) | (g<<8) | b) >>> 0);
       }
    }
    return bitmap;
-}
-
-// Inward feather on the flat grid; source planes remain immutable.
-function acAdjustFlatPlanes(planes,weight,amount) {
-   const factor=Math.pow(2,amount/50);
-   return planes.map(p=>Float32Array.from(p,(v,i)=>v*(1+weight[i]*(factor-1))));
-}
-function acFlatSelectionWeight(mask,w,h,pixels,scale) {
-   const d=new Int32Array(mask.length),q=[];
-   for(let y=0;y<h;++y) for(let x=0;x<w;++x) {
-      const i=y*w+x;
-      if(mask[i] && (!x || !y || x===w-1 || y===h-1 || !mask[i-1] || !mask[i+1] || !mask[i-w] || !mask[i+w])) {d[i]=1;q.push(i);}
-   }
-   for(let k=0;k<q.length;++k) {
-      const i=q[k],x=i%w,y=Math.floor(i/w);
-      for(const j of [x?i-1:-1,x<w-1?i+1:-1,y?i-w:-1,y<h-1?i+w:-1])
-         if(j>=0 && mask[j] && !d[j]) {d[j]=d[i]+1;q.push(j);}
-   }
-   return Float32Array.from(mask,(v,i)=>{const t=pixels>0?Math.min(1,Math.max(0,(d[i]-1)*scale/pixels)):1;return v*t*t*(3-2*t);});
-}
-function acApplyAdjustedFlat(original,base,planes) {
-   const W=original.image.width,H=original.image.height;
-   let window=null;
-   try {
-      window=acCreateOutput("AstroClean_Corrected",W,H,planes.length);
-      acEditOutput(window,image=>{
-         for(let c=0;c<planes.length;++c) {
-            const full=acUpsample(planes[c],base.w,base.h,W,H),norm=acMedian(full);
-            for(let y=0;y<H;y+=64) {
-               const rows=Math.min(64,H-y),samples=acReadRows(original.image,y,rows,c);
-               for(let i=0;i<samples.length;++i) samples[i]*=norm/full[y*W+i];
-               acWriteRows(image,y,rows,c,samples);processEvents();
-            }
-         }
-      });
-      window.keywords=original.window.keywords;
-      if(typeof window.copyAstrometricSolution==="function")window.copyAstrometricSolution(original.window);
-      window.mainView.stf=original.stf;
-      return Object.assign({},base,{window,corrected:window.mainView,flats:planes,editorStarless:null});
-   } catch(e) {if(window)window.forceClose();throw e;}
 }
 
 function acMaskEditor(original,starless,first,hidden,resumed) {
@@ -998,8 +1246,7 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    const factor = Math.min(64,Math.max(1,2**Math.floor(Math.log2(1/scale))));
    const input = acEditorPixels(original,width,height,factor);
    const stretch = acEditorStretch(input);
-   let gain = 1;
-   let flatEditing=false,flatWeight=null,flatDraft=null,flatUndo=null;
+   let gain = 1, highlight=1;
    let maskVisible=true, appliedMMT=2, appliedEdge=0;
    const canvas = new Control(dialog);
    canvas.setMinSize(400,300);
@@ -1011,8 +1258,9 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    status.wordWrapping = true;
 
    let working = first.mask, applied = first.window ? working : null;
-   let history = [];
-   let regions = [], appliedRegions = regions;
+   let history = [], manualEdits=[];
+   let sensitivity=50, fineCache=null, appliedFactor=first.factor || AC_FLAT_FACTOR;
+   const regions = [];
    let points = [], dragging = false;
    let mode = resumed ? "mask" : "after", busy = false, bitmap;
    let showStarless = !first.window, starlessPixels = null;
@@ -1036,15 +1284,6 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    }
    function correctedPixels() {
       if(!latest) return originalPixels();
-      if(flatDraft) {
-         const base=showStarless ? acCorrectedStarlessPreview(original,starless,latest,width,height,factor) : (afterPixels || (afterPixels=acEditorPixels(latest.corrected,width,height,factor)));
-         return base.map((p,c)=>{
-            const a=acUpsample(latest.flats[c],latest.w,latest.h,width,height);
-            const b=acUpsample(flatDraft[c],latest.w,latest.h,width,height);
-            const ratio=acMedian(flatDraft[c])/acMedian(latest.flats[c]);
-            return Float32Array.from(p,(v,i)=>v*ratio*a[i]/b[i]);
-         });
-      }
       if(showStarless) return acCorrectedStarlessPreview(original,starless,latest,width,height,factor);
       if(!afterPixels) afterPixels=acEditorPixels(latest.corrected,width,height,factor);
       return afterPixels;
@@ -1052,51 +1291,52 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    function viewStatus() {
       return (mode==="after" ? "Corrected" : "Original") + (showStarless ? " — without stars." : " — with stars.");
    }
+   // Visual approximation of the actual two-sided boundary smoothing band.
+   function previewMask() {
+      const binary=acUpsample(working,first.w,first.h,width,height,true);
+      const band=edgeSoft.value*width/source.width;
+      if(!band)return binary;
+      const d=new Int32Array(binary.length).fill(-1),q=new Int32Array(binary.length);
+      let tail=0;
+      for(let p=0;p<binary.length;++p) {
+         let edge=false;acNeighbors(p,width,height,false,n=>{if(binary[n]!==binary[p])edge=true;});
+         if(edge){d[p]=0;q[tail++]=p;}
+      }
+      for(let head=0;head<tail;++head){const p=q[head];if(d[p]>=band)continue;acNeighbors(p,width,height,false,n=>{if(d[n]<0){d[n]=d[p]+1;q[tail++]=n;}});}
+      return Float32Array.from(binary,(v,p)=>{if(d[p]<0)return v;const t=Math.min(1,(d[p]+0.5)/band),a=t*t*(3-2*t);return v?0.5+0.5*a:0.5-0.5*a;});
+   }
    function paintBitmap() {
       if (mode === "local") {
-         bitmap=acEditorBitmap(correctedPixels(),stretch,width,height,null,gain);
-         const sources=new Uint8Array(working.length);
-         for(const region of regions) for(let i=0;i<region.length;++i) sources[i]|=region[i];
-         const sky=acUpsample(sources,first.w,first.h,width,height,true);
-         for(let y=0;y<height;++y) for(let x=0;x<width;++x)
-            if(sky[y*width+x]) bitmap.setPixel(x,y,0xff5599dd);
+         bitmap=acEditorBitmap(correctedPixels(),stretch,width,height,null,gain,highlight);
       } else if (mode === "mask") {
-         const overlay = acUpsample(working,first.w,first.h,width,height,true);
+         const overlay = previewMask();
          if (showStarless && !starlessPixels)
             starlessPixels = acEditorPixels(starless,width,height,factor);
          const background = showStarless ? starlessPixels : input;
-         const skyOverlay = new Uint8Array(working.length);
-         for (const region of regions)
-            for (let i = 0; i < region.length; ++i) skyOverlay[i] |= region[i];
-         const sky = acUpsample(skyOverlay,first.w,first.h,width,height,true);
-         bitmap = acEditorBitmap(background,stretch,width,height,maskVisible?overlay:null,gain);
-         for (let y = 0; y < height; ++y)
-            for (let x = 0; x < width; ++x)
-               if (sky[y*width+x]) bitmap.setPixel(x,y,0xff5599dd);
+         bitmap = acEditorBitmap(background,stretch,width,height,maskVisible?overlay:null,gain,highlight);
       } else if (mode === "mask-only") {
-         const samples = acUpsample(working,first.w,first.h,width,height,true);
-         bitmap = acEditorBitmap([samples],[value => value ? 255 : 0],width,height);
+         const samples = previewMask();
+         bitmap = acEditorBitmap([samples],[value => Math.round(255*value)],width,height);
       } else if (mode === "flat") {
          if (!flatBitmap) {
             if (!flatPlanes) {
-               flatPlanes = (flatDraft || latest.flats).map(plane =>
-                  acUpsample(plane,latest.w,latest.h,width,height));
+               flatPlanes = latest.flats.map(plane =>
+                  acUpsample(plane,latest.flatW || latest.w,latest.flatH || latest.h,width,height));
                if(!flatStretch) flatStretch = acEditorStretch(flatPlanes);
             }
-            flatBitmap = acEditorBitmap(flatPlanes,flatStretch,width,height,null,gain);
+            flatBitmap = acEditorBitmap(flatPlanes,flatStretch,width,height,null,gain,highlight);
          }
          bitmap = flatBitmap;
       } else if (mode === "original") {
-         bitmap=acEditorBitmap(originalPixels(),stretch,width,height,null,gain);
+         bitmap=acEditorBitmap(originalPixels(),stretch,width,height,null,gain,highlight);
       } else {
-         bitmap=acEditorBitmap(correctedPixels(),stretch,width,height,null,gain);
+         bitmap=acEditorBitmap(correctedPixels(),stretch,width,height,null,gain,highlight);
       }
    }
 
    function refresh(rebuild = false) {
       if (rebuild) paintBitmap();
       add.enabled = remove.enabled = !busy && mode === "mask" && !dragging && points.length >= 3;
-      markSky.enabled = !busy && (mode === "mask" || mode === "local") && !dragging && points.length>=3;
       localApply.enabled = !busy && mode === "local" && !dragging && points.length>=3;
       localMode.enabled = !busy && !dragging;
       undoLocal.enabled = !busy && !!latest && !!latest.isRemoval && !!previous;
@@ -1104,8 +1344,10 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       visibility.text = maskVisible ? "Mask: On" : "Mask: Off";
       mmt.enabled = !busy && !(latest && latest.isRemoval);
       edgeSoft.enabled=mmt.enabled;
+      resolution.enabled=mmt.enabled && !external;
+      sensitivityApply.enabled=sensitivitySlider.enabled=!busy && !dragging && !external && !(latest && latest.isRemoval) && !!starless;
       undo.enabled = !busy && history.length > 0;
-      recalc.enabled = !busy && !dragging && (working !== applied || regions !== appliedRegions || mmt.value !== appliedMMT || edgeSoft.value !== appliedEdge) && !(latest && latest.isRemoval) &&
+      recalc.enabled = !busy && !dragging && (working !== applied || mmt.value !== appliedMMT || edgeSoft.value !== appliedEdge || resolutionFactors[resolution.currentItem] !== appliedFactor) && !(latest && latest.isRemoval) &&
          (!!latest || working.some(value => value !== 0));
       toggle.enabled = !busy && !!latest;
       originalView.enabled = !busy && !dragging;
@@ -1114,20 +1356,11 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       backgroundButton.text = showStarless ? "Stars: Off" : "Stars: On";
       maskOnly.enabled = !busy && !dragging;
       inspectFlat.enabled = maskOnly.enabled && !!latest && !!latest.flats;
-      stretchSlider.enabled = !busy && !dragging && mode !== "mask-only";
-      finish.enabled = !busy && !!latest && working === applied && regions === appliedRegions && (latest && latest.isRemoval || (mmt.value === appliedMMT && edgeSoft.value === appliedEdge));
+      highlightSlider.enabled = stretchSlider.enabled = !busy && !dragging && mode !== "mask-only";
+      finish.enabled = !busy && !!latest && working === applied && (latest && latest.isRemoval || (mmt.value === appliedMMT && edgeSoft.value === appliedEdge && resolutionFactors[resolution.currentItem] === appliedFactor));
       cancel.enabled = !busy;
       toggle.text = "Corrected";
-      if(external) for(const control of [overlay,visibility,maskOnly,add,remove,markSky,undo,localMode,localApply,undoLocal,recalc,mmt,edgeSoft]) control.enabled=false;
-      flatEdit.enabled=!busy && !external && !!latest && !!latest.flats && working===applied && regions===appliedRegions && mmt.value===appliedMMT && edgeSoft.value===appliedEdge;
-      flatSelect.enabled=flatEdit.enabled && flatEditing && !dragging && points.length>=3;
-      flatAmount.enabled=flatEdit.enabled && !!flatWeight;
-      flatFeather.enabled=flatEdit.enabled && flatEditing && !flatWeight;
-      flatApply.enabled=flatEdit.enabled && !!flatDraft;
-      flatRevert.enabled=!busy && (!!flatUndo || flatEditing);
-      if(flatEditing) {
-         for(const c of [overlay,visibility,maskOnly,add,remove,markSky,undo,localMode,localApply,undoLocal,recalc,mmt,edgeSoft,originalView,finish]) c.enabled=false;
-      }
+      if(external) for(const control of [overlay,visibility,maskOnly,add,remove,undo,localMode,localApply,undoLocal,recalc,mmt,edgeSoft]) control.enabled=false;
       status.text = message;
       canvas.update();
    }
@@ -1144,11 +1377,13 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       refresh(true);
    });
    function applyLasso(value) {
+      const polygon=points.slice();
       const change = acLassoMask(working,first.w,first.h,points,width,height,value);
       points = [];
       if (change.changed > 0) {
-         history.push({working,regions});
+         history.push({working,manualEdits,sensitivity});
          working = change.mask;
+         manualEdits=manualEdits.concat([{polygon,value}]);
          message = "Mask updated. Click Calculate to apply this edit.";
          refresh(true);
       } else {
@@ -1159,43 +1394,23 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    }
    const add = button("Add to mask",() => applyLasso(1));
    const remove = button("Remove from mask",() => applyLasso(0));
-   const markSky = button("Mark background",() => {
-      const region = acLassoMask(new Uint8Array(working.length),first.w,first.h,points,width,height,1).mask;
-      let count = 0;
-      for (let i = 0; i < region.length; ++i)
-         if (region[i] && working[i]) {
-            message = "Sky selection overlaps protected pixels. Choose a clear area outside the green mask.";
-            refresh();
-            return;
-         } else count += region[i];
-      if (count < 9) {
-         message = "Choose a larger sky region.";
-         refresh();
-         return;
-      }
-      history.push({working,regions});
-      regions = regions.concat([region]);
-      points = [];
-      message = regions.length + " source regions selected. Each source is assigned to the nearest masked object.";
-      refresh(true);
-   });
    const undo = button("Undo mask edit",() => {
       if (!history.length) return;
       const restored = history.pop();
       working = restored.working;
-      regions = restored.regions;
+      manualEdits=restored.manualEdits; sensitivity=restored.sensitivity;
+      sensitivitySlider.value=sensitivity;sensitivityValue.text=String(sensitivity);
       points = [];
       mode = "mask";
       message = working === applied ? "Showing the last applied mask." : "Mask edit undone.";
       refresh(true);
    });
    const recalc = button("Calculate",() => {
-      if(flatUndo){hidden.delete(flatUndo.window);flatUndo.window.forceClose();flatUndo=null;}
       busy = true;
       message = "Calculating the synthetic flat…";
       refresh();
       try {
-         const result = acRun(original,starless,{preparedMask:working,regions,mmtLayers:mmt.value,edgePixels:edgeSoft.value});
+         const result = acRun(original,starless,{preparedMask:working,regions,mmtLayers:mmt.value,edgePixels:edgeSoft.value,factor:resolutionFactors[resolution.currentItem]});
          hidden.add(result.window);
          if (previous) {
             previous.window.forceClose();
@@ -1204,8 +1419,7 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
          previous = latest;
          latest = result;
          applied = working;
-         appliedRegions = regions;
-         appliedMMT=mmt.value;appliedEdge=edgeSoft.value;
+         appliedMMT=mmt.value;appliedEdge=edgeSoft.value;appliedFactor=resolutionFactors[resolution.currentItem];
          beforePixels = afterPixels;
          afterPixels = flatPlanes = flatStretch = null;
          beforeBitmap = afterBitmap = flatBitmap = null;
@@ -1227,7 +1441,6 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       refresh(true);
    });
    const localApply=button("Remove",()=>{
-      if(flatUndo){hidden.delete(flatUndo.window);flatUndo.window.forceClose();flatUndo=null;}
       const target=acLassoMask(new Uint8Array(working.length),first.w,first.h,points,width,height,1).mask;
       busy=true;message="Preparing local Remove…";refresh();processEvents();
       const progress=new Dialog;progress.windowTitle="AstroClean — Local Remove";
@@ -1238,7 +1451,9 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
          const tick=text=>{if(text) label.text=text;processEvents();};
          const result=acRemoveLocal(original,starless,latest,target,working,first.w,first.h,regions,tick);
          hidden.add(result.window);
-         if(previous){previous.window.forceClose();hidden.delete(previous.window);}
+         if(previous){
+            previous.window.forceClose();hidden.delete(previous.window);
+         }
          if(!latest) {
             const backup=acCreateOutput("AstroClean_BeforeRemove",source.width,source.height,source.isColor?3:1);
             acEditOutput(backup,image=>image.assign(original.image));
@@ -1246,10 +1461,10 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
             latest={window:backup,corrected:backup.mainView,mask:working,w:first.w,h:first.h,flats:null,isRemoval:false};
          }
          previous=latest;latest=result;
-         applied=working;appliedRegions=regions;appliedMMT=mmt.value;appliedEdge=edgeSoft.value;
+         applied=working;appliedMMT=mmt.value;appliedEdge=edgeSoft.value;appliedFactor=resolutionFactors[resolution.currentItem];
          beforePixels=afterPixels=flatPlanes=flatStretch=null;
          beforeBitmap=afterBitmap=flatBitmap=null;points=[];mode="after";
-         message="Local Remove applied to the image. Undo Remove restores the previous result. No synthetic flat was applied by Remove.";
+         message="Local Remove applied. Undo Remove restores the previous result.";
          acRememberPair(original,starless);
       } catch(e){message=e.message;}
       finally{progress.hide();busy=false;refresh(true);}
@@ -1259,8 +1474,7 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       latest.window.forceClose();hidden.delete(latest.window);
       latest=previous;previous=null;
       applied=latest.flats ? latest.mask : null;
-      appliedRegions=latest.sourceRegions || regions;
-      appliedMMT=latest.mmtLayers || 2;appliedEdge=latest.edgePixels || 0;
+      appliedMMT=latest.mmtLayers || 2;appliedEdge=latest.edgePixels || 0;appliedFactor=latest.factor || AC_FLAT_FACTOR;
       beforePixels=afterPixels=flatPlanes=flatStretch=null;
       beforeBitmap=afterBitmap=flatBitmap=null;mode="after";
       message="Last local Remove undone.";refresh(true);
@@ -1269,7 +1483,7 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       mode="original";points=[];message=viewStatus();refresh(true);
    });
    const toggle = button("Corrected",() => {
-      mode="after";if(!flatEditing) points=[];message=viewStatus();refresh(true);
+      mode="after";points=[];message=viewStatus();refresh(true);
    });
    const maskOnly = button("Mask only",() => {
       mode = "mask-only";
@@ -1283,18 +1497,18 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       refresh(true);
    });
    const finish = button("Finish",() => {
-      if (!busy && latest && working === applied && regions === appliedRegions && (latest.isRemoval || (mmt.value === appliedMMT && edgeSoft.value === appliedEdge))) dialog.ok();
+      if (!busy && latest && working === applied && (latest.isRemoval || (mmt.value === appliedMMT && edgeSoft.value === appliedEdge && resolutionFactors[resolution.currentItem] === appliedFactor))) dialog.ok();
    });
    const cancel = button("Cancel",() => dialog.cancel());
    const stretchLabel = new Label(dialog);
    const stretchSlider = new Slider(dialog);
-   stretchSlider.setRange(-20,20);
-   stretchSlider.value = 0;
+   stretchSlider.setRange(0,100);
+   stretchSlider.value = 50;
    stretchSlider.toolTip = "Adjust preview brightness without changing the image data.";
-   stretchLabel.text = "Preview stretch  1.00×";
+   stretchLabel.text = "Background  50";
    stretchSlider.onValueUpdated = value => {
-      gain = 2**(value/10);
-      stretchLabel.text = "Preview stretch  " + gain.toFixed(2) + "×";
+      gain = 2**((value-50)/25);
+      stretchLabel.text = "Background  " + value;
       beforeBitmap = afterBitmap = flatBitmap = null;
       refresh(true);
    };
@@ -1303,6 +1517,12 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    stretchRow.add(stretchLabel);
    stretchRow.add(stretchSlider,100);
 
+   const highlightLabel=new Label(dialog);highlightLabel.text="Highlights  50";
+   const highlightSlider=new Slider(dialog);highlightSlider.setRange(0,100);highlightSlider.value=50;
+   highlightSlider.toolTip="Adjust bright preview structures without modifying linear data.";
+   highlightSlider.onValueUpdated=value=>{highlight=2**((value-50)/20);highlightLabel.text="Highlights  "+value;beforeBitmap=afterBitmap=flatBitmap=null;refresh(true);};
+   const highlightRow=new HorizontalSizer;highlightRow.spacing=8;highlightRow.add(highlightLabel);highlightRow.add(highlightSlider,100);
+
    const mmt=new SpinBox(dialog);
    mmt.minValue=1;mmt.maxValue=6;mmt.value=2;
    mmt.toolTip="Disabled MMT detail layers; only R is retained. Applied on the quarter-size model. Default: 2.";
@@ -1310,15 +1530,56 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    const mmtLabel=new Label(dialog);mmtLabel.text="MMT layers + R:";
    const edgeSoft=new SpinBox(dialog);edgeSoft.minValue=0;edgeSoft.maxValue=128;edgeSoft.value=0;
    edgeSoft.toolTip="Optional softening of the filled flat boundary, in original-image pixels. 0 preserves the current method. Requires Calculate.";
-   edgeSoft.onValueUpdated=()=>{message="Edge softening changed. Click Calculate.";refresh();};
+   edgeSoft.onValueUpdated=()=>{message="Edge softening changed. Click Calculate.";refresh(true);};
    const edgeLabel=new Label(dialog);edgeLabel.text="Edge soften (px):";
    const mmtRow=new HorizontalSizer;mmtRow.spacing=7;mmtRow.add(mmtLabel);mmtRow.add(mmt);mmtRow.addSpacing(14);mmtRow.add(edgeLabel);mmtRow.add(edgeSoft);mmtRow.addStretch();
 
+   const resolutionFactors=[4,2,1];
+   const resolution=new ComboBox(dialog);
+   for(const label of ["25%","50%","100%"]) resolution.addItem(label);
+   resolution.currentItem=resolutionFactors.indexOf(appliedFactor);
+   resolution.onItemSelected=()=>{message="Flat resolution changed. Click Calculate.";refresh();};
+   const resolutionLabel=new Label(dialog);resolutionLabel.text="Flat resolution:";
+   mmtRow.add(resolutionLabel);mmtRow.add(resolution);
+   const sensitivitySlider=new Slider(dialog);sensitivitySlider.setRange(0,100);sensitivitySlider.value=50;
+   const sensitivityLabel=new Label(dialog);sensitivityLabel.text="Mask sensitivity:";
+   const sensitivityValue=new Label(dialog);sensitivityValue.text="50";
+   const sensitivityRow=new HorizontalSizer;sensitivityRow.spacing=7;sensitivityRow.add(sensitivityLabel);sensitivityRow.add(sensitivitySlider,100);sensitivityRow.add(sensitivityValue);
+   sensitivitySlider.onValueUpdated=v=>{sensitivityValue.text=String(v);};
+   function updateSensitivity(){
+      const v=sensitivitySlider.value;
+      if(busy || v===sensitivity || external || !starless)return;
+      busy=true;message="Updating automatic mask…";refresh();processEvents();
+      const waiting=new Dialog;
+      waiting.windowTitle="AstroClean — Updating mask";
+      const waitLabel=new Label(waiting);
+      waitLabel.text="Updating automatic mask…";waitLabel.setMinWidth(440);
+      waiting.sizer=new VerticalSizer;waiting.sizer.margin=14;waiting.sizer.add(waitLabel);
+      waiting.adjustToContents();
+      let spinner=null;
+      try{
+         let pulse=0;
+         const tick=()=>{waitLabel.text=["◐","◓","◑","◒"][pulse++%4]+"  Updating automatic mask…";processEvents();};
+         waiting.show();tick();spinner=acSpinner(waitLabel);
+         if(!fineCache)fineCache=acDownsampleImage(starless.image,2,true,tick)[0];
+         let next=acMask(fineCache,original.image.width>>1,original.image.height>>1,tick,v,AC_DEBUG_MASK);
+         for(const edit of manualEdits)next=acLassoMask(next,first.w,first.h,edit.polygon,width,height,edit.value).mask;
+         history.push({working,manualEdits,sensitivity});
+         working=next;sensitivity=v;mode="mask";maskVisible=true;
+         message="Mask updated. Click Calculate to apply.";
+      }catch(e){sensitivitySlider.value=sensitivity;message=e.message;}
+      finally{if(spinner)spinner.stop();waiting.hide();busy=false;refresh(true);}
+   }
+   // Explicit apply also supports keyboard adjustment and avoids recalculating during drag.
+   const sensitivityApply=button("Update mask",updateSensitivity);sensitivityRow.add(sensitivityApply);
+   sensitivitySlider.onMouseRelease=()=>updateSensitivity();
+
+   let zoom=1, panX=0, panY=0, panning=false, panStart=null;
    function fit() {
-      const scale = Math.min(canvas.width/width,canvas.height/height);
+      const scale = Math.min(canvas.width/width,canvas.height/height)*zoom;
       const w = Math.max(1,Math.round(width*scale));
       const h = Math.max(1,Math.round(height*scale));
-      return {x:Math.floor((canvas.width-w)/2),y:Math.floor((canvas.height-h)/2),w,h};
+      return {x:Math.floor((canvas.width-w)/2+panX),y:Math.floor((canvas.height-h)/2+panY),w,h};
    }
    function point(x,y) {
       const area = fit();
@@ -1327,25 +1588,47 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
          y:Math.min(height-1,Math.max(0,(y-area.y)*(height-1)/Math.max(1,area.h-1)))
       };
    }
-   canvas.onResize = () => canvas.update();
+   function clampPan(){
+      const a=fit();
+      const mx=Math.max(0,(a.w-canvas.width)/2),my=Math.max(0,(a.h-canvas.height)/2);
+      panX=Math.max(-mx,Math.min(mx,panX));panY=Math.max(-my,Math.min(my,panY));
+   }
+   function changeZoom(mult,x,y){
+      if(busy || dragging || panning)return;
+      const p=point(x,y);zoom=Math.max(1,Math.min(8,zoom*mult));
+      const a=fit();panX+=x-(a.x+p.x*(a.w-1)/(width-1));panY+=y-(a.y+p.y*(a.h-1)/(height-1));
+      clampPan();canvas.update();
+   }
+   const zoomRow=new HorizontalSizer;zoomRow.spacing=7;
+   zoomRow.add(button("Zoom +",()=>changeZoom(1.5,canvas.width/2,canvas.height/2)));
+   zoomRow.add(button("Zoom -",()=>changeZoom(1/1.5,canvas.width/2,canvas.height/2)));
+   zoomRow.add(button("Fit",()=>{if(!busy&&!dragging){zoom=1;panX=panY=0;canvas.update();}}));zoomRow.addStretch();
+   canvas.onMouseWheel=(x,y,delta)=>{if(delta)changeZoom(delta>0?1.25:0.8,x,y);};
+   canvas.onResize = () => {clampPan();canvas.update();};
    canvas.onMousePress = (x,y,mouseButton) => {
-      if (busy || (mode !== "mask" && mode !== "local" && !(flatEditing && (mode==="after" || mode==="flat"))) || mouseButton !== 1) return;
+      if(!busy && !dragging && (mouseButton===2 || mouseButton===4)){panning=true;panStart={x,y,panX,panY};return;}
+      if (busy || (mode !== "mask" && mode !== "local") || mouseButton !== 1) return;
       const area = fit();
       if (x < area.x || y < area.y || x >= area.x+area.w || y >= area.y+area.h) return;
-      points = [point(x,y)];
+      const start = point(x,y);
+      points = [start];
       dragging = true;
       refresh();
    };
    canvas.onMouseMove = (x,y) => {
+      if(panning){panX=panStart.panX+x-panStart.x;panY=panStart.panY+y-panStart.y;clampPan();canvas.update();return;}
       if (!dragging) return;
       const last = points[points.length-1];
       const p = point(x,y);
-      if (Math.hypot(last.x-p.x,last.y-p.y) >= 2) points.push(p);
+      if (Math.hypot(last.x-p.x,last.y-p.y) >= 2/zoom) points.push(p);
       canvas.update();
    };
-   canvas.onMouseRelease = (x,y) => {
-      if (!dragging) return;
-      points.push(point(x,y));
+   canvas.onMouseRelease = (x,y,mouseButton) => {
+      if(panning){if((mouseButton===2 || mouseButton===4) || mouseButton===undefined){panning=false;panStart=null;}return;}
+      if (!dragging || (mouseButton!==undefined && mouseButton!==1)) return;
+      const p=point(x,y), last=points[points.length-1];
+      if(Math.hypot(last.x-p.x,last.y-p.y)>=2/zoom) points.push(p);
+      if(points.length<3) points=[];
       dragging = false;
       refresh();
    };
@@ -1360,7 +1643,7 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
             x:area.x+p.x*(area.w-1)/(width-1),
             y:area.y+p.y*(area.h-1)/(height-1)
          });
-         if ((mode === "mask" || mode === "local" || flatEditing) && points.length > 1) {
+         if ((mode === "mask" || mode === "local") && points.length > (dragging ? 1 : 2)) {
             graphics.pen = new Pen(0xffffd262,2);
             for (let i = 1; i < points.length; ++i) {
                const a = screen(points[i-1]), b = screen(points[i]);
@@ -1376,61 +1659,11 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
       }
    };
 
-   function clearFlatPreview() {
-      flatDraft=null;flatWeight=null;flatAmount.value=1000;flatValue.text="Flat brightness: 1.0000×";points=[];
-      flatPlanes=flatBitmap=null;
-   }
-   const flatEdit=button("Edit flat",()=>{
-      clearFlatPreview();flatEditing=true;
-      if(mode!=="flat")mode="after";
-      message="Draw on Corrected or Synthetic flat, then Select area. Flat brightness changes both views.";refresh(true);
-   });
-   const flatSelect=button("Select area",()=>{
-      const mask=acLassoMask(new Uint8Array(latest.w*latest.h),latest.w,latest.h,points,width,height,1).mask;
-      if(!mask.some(v=>v))return;
-      flatWeight=acFlatSelectionWeight(mask,latest.w,latest.h,flatFeather.value,source.width/latest.w);
-      message="Adjust Flat brightness: darker flat brightens Corrected. Apply edit commits the result.";refresh();
-   });
-   const flatAmount=new Slider(dialog);flatAmount.setRange(0,2000);flatAmount.value=1000;
-   flatAmount.toolTip="Local flat brightness: 0.9000–1.1000×; centre = 1.0000×. Arrow keys adjust by 0.0001. Preview is approximate; Apply edit computes full resolution.";
-   const flatValue=new Label(dialog);flatValue.text="Flat brightness: 1.0000×";
-   flatAmount.onValueUpdated=position=>{
-      const multiplier=0.9+position/10000;
-      const value=50*Math.log2(multiplier);
-      if(!flatWeight)return;
-      flatDraft=acAdjustFlatPlanes(latest.flats,flatWeight,value);
-      flatValue.text="Flat brightness: "+multiplier.toFixed(4)+"×";
-      flatPlanes=flatBitmap=null;refresh(true);
-   };
-   const flatFeather=new SpinBox(dialog);flatFeather.minValue=0;flatFeather.maxValue=512;flatFeather.value=30;
-   flatFeather.toolTip="Inward feather in original-image pixels; choose before Select area.";
-   const flatFeatherLabel=new Label(dialog);flatFeatherLabel.text="Edit feather (px):";
-   const flatApply=button("Apply edit",()=>{
-      if(!flatDraft)return;
-      busy=true;message="Applying flat edit at full resolution…";refresh();processEvents();
-      try {
-         const result=acApplyAdjustedFlat(original,latest,flatDraft);hidden.add(result.window);
-         if(flatUndo){flatUndo.window.forceClose();hidden.delete(flatUndo.window);}
-         flatUndo=latest;latest=result;
-         flatEditing=false;clearFlatPreview();afterPixels=null;flatStretch=null;
-         mode="after";message="Flat edit applied. Corrected and exported flat use the edited model.";
-      } catch(e){message=e.message;}
-      finally{busy=false;refresh(true);}
-   });
-   const flatRevert=button("Undo flat edit",()=>{
-      if(flatEditing){flatEditing=false;clearFlatPreview();message="Unapplied flat edit discarded.";}
-      else if(flatUndo){latest.window.forceClose();hidden.delete(latest.window);latest=flatUndo;flatUndo=null;clearFlatPreview();afterPixels=null;flatStretch=null;message="Last flat edit undone.";}
-      mode="after";refresh(true);
-   });
-   const flatRow=new HorizontalSizer;flatRow.spacing=7;
-   for(const c of [flatEdit,flatSelect,flatFeatherLabel,flatFeather,flatApply,flatRevert])flatRow.add(c);
-   const flatSliderRow=new HorizontalSizer;flatSliderRow.spacing=7;flatSliderRow.add(flatValue);flatSliderRow.add(flatAmount,100);
-
    const tools = new HorizontalSizer;
    tools.spacing=7;
    for(const control of [overlay,visibility,backgroundButton,maskOnly]) tools.add(control);
    const edits=new HorizontalSizer;edits.spacing=7;
-   for(const control of [add,remove,markSky,undo]) edits.add(control);
+   for(const control of [add,remove,undo]) edits.add(control);
    const actions=new HorizontalSizer;actions.spacing=7;
    for(const control of [localMode,localApply,undoLocal,recalc]) actions.add(control);
    const outputs=new HorizontalSizer;outputs.spacing=7;
@@ -1441,19 +1674,20 @@ function acMaskEditor(original,starless,first,hidden,resumed) {
    dialog.sizer.spacing = 7;
    dialog.sizer.add(instruction);
    dialog.sizer.add(canvas,100);
+   dialog.sizer.add(zoomRow);
    dialog.sizer.add(status);
    dialog.sizer.add(stretchRow);
+   dialog.sizer.add(highlightRow);
    dialog.sizer.add(mmtRow);
+   dialog.sizer.add(sensitivityRow);
    dialog.sizer.add(tools);
    dialog.sizer.add(edits);
    dialog.sizer.add(actions);
-   dialog.sizer.add(flatRow);
-   dialog.sizer.add(flatSliderRow);
    dialog.sizer.add(outputs);
    dialog.adjustToContents();
    dialog.resize(960,720);
    refresh(true);
-   if (dialog.execute() && working === applied && regions === appliedRegions) return latest;
+   if (dialog.execute() && working === applied) return latest;
    return null;
 }
 
@@ -1491,9 +1725,13 @@ function acRememberPair(original,starless) {
    }
 }
 
-const acHelpText = "2.6.8: Edit flat — draw on Corrected or Synthetic flat, set Edit feather, Select area, adjust Flat brightness, then Apply edit. Darker flat brightens Corrected. Slider preview is approximate; Apply edit uses full resolution. Undo flat edit discards a pending edit or restores the last applied edit. Finish exports the edited flat. Calculate rebuilds it.\n\nAstroClean 2.6.8 test\n\u00a9 Morten Lerager\n\nRun AstroClean opens automatic object detection and the editor before calculation. Resume from mask reopens saved protection.\n\nSynthetic flat\nGreen marks objects excluded from the flat. Add to mask and Remove from mask edit that protection only. Mask: On/Off changes visibility without changing pixels. MMT layers + R ranges from 1 to 6, default 2, at quarter-size working resolution. Calculate applies the mask, sources and MMT selection. A changed MMT value requires Calculate before Finish.\n\nLocal Remove (experimental)\nClick Local Remove, draw a lasso around the unwanted reflection or other image feature, then click Remove. This action changes the result image directly and does not change the object mask. It works without calculating a synthetic flat first. The source Original and Starless remain untouched. Finish opens a new result.\n\nRemove estimates a local background from starless data, feathers the correction inside the lasso over approximately 16 original pixels, and subtracts only that difference from the matching image with stars. It does not copy background texture onto stars. Faint real structure inside the selection can also be removed. Select only the unwanted feature, with a little margin for feathering.\n\nOptional Mark background selections are clean local sources; avoid protected objects and the feature being removed. Automatic donors exclude the object mask. Undo Remove restores the immediately previous result, one step. Additional Remove operations can be applied successively. Calculate is disabled after Remove; Undo Remove returns to the prior calculated result. For a fresh flat after multiple removes, restart with the untouched inputs. Synthetic flat is disabled after Remove because local repairs are not represented by a flat.\n\nThe editor starts at approximately 4:3, remains resizable and fits the image without stretching its aspect ratio. Tool buttons are grouped on shorter rows.\n\nFinish exports the mask and flat for a flat calculation. For Local Remove it opens only the directly repaired result. Cancel discards unpublished results. Sources and local repair selections are session-only.\n\nInstall AstroClean_v268.js via Execute Script File or Feature Scripts / MyScript. Requires PixInsight 1.9.6 / V8 and native MMT.\n\nValidation: syntax, numerical local-repair tests and mocked editor/process integration. This environment cannot execute native PixInsight; test dialog layout and the experimental Remove on copies. Large-object reconstruction remains outside this version's intended use.\n\nThe local-fill code is independently implemented. BlemishBlaster by Franklin Marek inspired the workflow; no BlemishBlaster code is embedded.\n\n2.6.8 fix: Calculate completion now assigns a strict boolean to Undo Remove availability. Standard flat results explicitly identify themselves as non-removal results. Image-processing calculations are unchanged.\n\n2.6.8 \u2014 Four image views\nOriginal and Corrected select the before/after image. Stars: On/Off switches between with-stars and starless in either view. All four share the same fixed preview stretch and brightness slider. Calculate always ends on Corrected and retains the selected Stars setting.\n\nCorrected Starless is computed from the existing starless input using exactly the same full-resolution flat gain as Corrected. No new star removal is run. For Local Remove, the applied local difference is transferred to the corrected starless preview too. The first corrected-starless display can take extra time; it is cached for that result. Exports still contain the corrected image with stars.\n\nMask overlay remains the input image for editing protection. Mask: Off only hides the overlay; use Corrected to inspect the output.\n\n2.6.8\nCalculate now always ends on Corrected with Stars: On.\nEdge soften (px) is optional, 0\u2013128 original-image pixels, default 0. Start with 32 if the flat has a sharp boundary. Calculate applies the choice. It smooths only a narrow band around the filled flat boundary before MMT. It does not change the binary object mask, and it never directly mixes the original galaxy back into the fill. Nearby unmasked signal can still influence smoothing, so inspect the result. Return to 0 to restore the previous filtering exactly. MMT remains 2 by default.\n\nApply existing flat \u2014 2.6.8\nOpen Original and your edited synthetic flat in PixInsight. Select them in Original and Existing synthetic flat, then click Apply existing flat. Starless is optional in this mode; leave it unselected if you only need views with stars. If selected, it must be a matching starless copy of Original.\n\nThe supplied flat is read at full resolution and used directly with Original \u00d7 median(flat) / flat, independently per channel. It is not smoothed, regenerated or rescaled, and the source views are not modified. Dimensions and channels must match. All flat pixels must be finite and strictly positive.\n\nThe editor opens on Corrected with Stars On. Original/Corrected, Stars On/Off (when Starless was supplied), Synthetic flat and preview stretch remain available. Mask editing, MMT, Edge soften, Calculate and Local Remove are disabled in this mode. An existing mask is ignored.\n\nFinish opens only the new corrected image. It does not duplicate or overwrite the supplied flat. Cancel discards the new result. Save images explicitly in PixInsight if you want files on disk.\n";
+const acHelpText = "AstroClean 2.8.7\n\u00a9 Morten Lerager\n\nIntroduction\nAstroClean removes residual dust shadows, diffuse reflections and other background defects from linear astronomical images using a synthetic flat. The object mask protects genuine astronomical structures from being included in the flat. AstroClean complements, rather than replaces, normal calibration and gradient correction.\n\nRequirements\nUse PixInsight 1.9.6 with V8 and native MultiscaleMedianTransform (MMT). Open a linear Original and a matching linear Starless image with identical geometry and channels. Do not permanently stretch either image. For an existing flat, Starless is optional.\n\nQuick start\n  Select Original and Starless and click  Run AstroClean .  Inspect the automatic green object mask. Add missing galaxies or nebulosity; remove any protected dust shadows or reflections.  Click  Calculate  and inspect Corrected and Synthetic flat.  Adjust the mask or parameters and calculate again if necessary.  Click  Finish  to open the output images. Save them in PixInsight if required.  \n\nMask editor\nGreen areas protect real objects. Use Add to mask or Remove from mask and draw a lasso. Undo mask edit reverses the last edit. Mask On/Off changes overlay visibility only; Mask only displays the protection mask. Mouse wheel zooms; right or middle drag pans; Fit resets the view. Original and Corrected select the before/after image; Stars On/Off switches the corresponding preview. Background and Highlights adjust display stretch only, not the linear data.\n\nParameters\n   Parameter  Purpose    Mask sensitivity (0\u2013100, default 50)  Higher values generally protect more faint structure. Click Update mask to apply and replay manual lasso edits.    MMT layers + R (1\u20136, default 2)  Number of suppressed detail layers in the flat model. Higher values produce a smoother model but can lose small dust shadows.    Edge soften (0\u2013128 px, default 0)  Smooths the filled boundary without changing the binary mask. Try 30\u201350 pixels if a boundary is visible.    Flat resolution (25%, 50%, 100%; default 25%)  Higher resolution can retain smaller defects at greater processing cost.    Click Calculate after changing flat parameters. \n\nSynthetic flat calculation\nProtected areas are reconstructed from surrounding background using regularized thin-plate spline (TPS) interpolation. Boundary softening and MMT filtering form the flat model. The corrected image is computed per channel as Original \u00d7 median(flat) / flat. Dust shadows and reflections should remain visible in the flat, while real astronomical objects should not. Inspect both outputs; a synthetic flat is an estimate, not a measured calibration flat.\n\nLocal Remove\nSelect Local Remove, draw a lasso around an unwanted feature, and click Remove. TPS reconstructs the local background on the starless working image, excluding protected areas from background sampling. The additive difference is transferred to the image with stars, with an approximately 16-pixel internal feather. No synthetic flat is generated or changed by this operation. Undo Remove restores the preceding result (one step). Further removals can be applied successively. Calculate is disabled after a removal; restart with the original inputs for a fresh flat if needed. Real structures within the selection can also be removed; missing stars or hidden detail cannot be reconstructed. Use a small margin around the defect.\n\nResume from mask\nOpen Original, Starless and the saved grayscale mask with matching dimensions. Select Existing mask and click Resume from mask. Edit the protection and calculate a new flat.\n\nApply existing flat\nOpen Original and a matching linear synthetic flat, including one edited externally. Select Existing synthetic flat and click Apply existing flat. The supplied flat is used directly at full resolution, without smoothing or regeneration. Dimensions and channels must match and all flat samples must be finite and positive. Starless is optional. Mask editing, Calculate and Local Remove are disabled. Finish opens only the corrected image.\n\nOutput images\nFinish opens a new image named after Original with the suffix _AstroClean. A calculated mask and synthetic flat are also opened with _Mask and _SyntheticFlat suffixes. If Local Remove follows Calculate, the previously calculated mask and flat are retained; they do not represent the additive local repair. Local Remove alone produces only the repaired image. Cancel discards unpublished results. Source images are not overwritten; save outputs explicitly.\n\nTips and limitations\nIf a dust shadow remains, check that it is not protected by the mask and try a higher flat resolution or fewer MMT layers. If galaxy structure appears in the flat, expand the mask to include faint outer regions. For large objects occupying most of the frame, surrounding background may be insufficient for reliable interpolation. Inspect the result at a consistent stretch. Local Remove is intended for localized defects, not recovery of obscured astronomical detail.\n\nCredits\nCopyright \u00a9 Morten Lerager 2026. The Local Remove workflow was inspired by BlemishBlaster by Franklin Marek; no BlemishBlaster code is embedded.";
 
 function acShowHelp() {
+   try {
+      if (typeof Dialog.browseScriptDocumentation === "function" && Dialog.browseScriptDocumentation("AstroClean")) return;
+   } catch (e) {}
+   // Fallback for installations without the external documentation.
    const dialog = new Dialog;
    dialog.windowTitle = "AstroClean — Documentation";
    const text = new TextBox(dialog);
@@ -1543,14 +1781,14 @@ function acHelpButton(parent) {
 
 function acCredit(parent) {
    const label = new Label(parent);
-   label.text = "\u00a9 Morten Lerager  |  AstroClean v2.6.8";
+   label.text = "\u00a9 Morten Lerager  |  AstroClean v2.8.7";
    return label;
 }
 
 function acDialog() {
    console.hide();
    const dialog = new Dialog;
-   dialog.windowTitle = "AstroClean v2.6.8 experimental";
+   dialog.windowTitle = "AstroClean v2.8.7";
    const note = new Label(dialog);
    note.text = "Build a flat from Original + Starless, or apply an existing flat to Original. Starless is optional when applying a flat.";
    note.wordWrapping=true;
@@ -1661,7 +1899,7 @@ function acDialog() {
          const hidden=new Set([appliedFlat.window]);
          try {
             const approved=acMaskEditor(original,sky,appliedFlat,hidden,false);
-            if(approved){approved.window.show();hidden.delete(approved.window);}
+            if(approved){approved.window.mainView.id=acOutputId(original.id+"_AstroClean");approved.window.show();hidden.delete(approved.window);}
          } finally {for(const window of hidden)if(!window.isNull)window.forceClose();}
          return;
       }
@@ -1700,7 +1938,9 @@ function acDialog() {
       try {
          approved = acMaskEditor(original,starless,result,hidden,manual || (editRequest && editRequest.resume));
          if (approved) {
-            acShowIntermediates(approved);
+            approved.window.mainView.id=acOutputId(original.id+"_AstroClean");
+            const intermediates=approved.isRemoval && approved.baseFlats ? Object.assign({},approved,{flats:approved.baseFlats,mask:approved.baseMask,w:approved.baseW,h:approved.baseH}) : approved;
+            acShowIntermediates(intermediates,approved.window.mainView.id);
             approved.window.show();
             hidden.delete(approved.window);
          }

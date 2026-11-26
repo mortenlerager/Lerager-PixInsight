@@ -1,6 +1,6 @@
 # Lerager PixInsight Scripts
 
-AstroClean 2.6.8 and AlignRGB Preview 0.3, by Morten Lerager.
+AstroClean 2.8.7 and AlignRGB Preview 0.3, by Morten Lerager.
 
 ## PixInsight installation (test release, UNSIGNED)
 
@@ -16,4 +16,4 @@ The scripts are installed under `src/scripts/Lerager/` and appear in Script > Le
 
 ## Releasing updates
 
-Edit the script in `src/scripts/Lerager/`, update version strings as needed, run `python tools/build.py`, and upload the updated script, `updates/updates.xri`, and the newly built ZIP to GitHub. Each release must use a new package name (date alone is insufficient for multiple releases on the same day). Sign the XRI with the PixInsight-supported workflow once a registered identity is available.
+Edit the script in `src/scripts/Lerager/`, update version strings as needed, run `python tools/build.py`, and upload the updated script and documentation, `updates/updates.xri`, and the newly built ZIP to GitHub. Each release must use a new package name (date alone is insufficient for multiple releases on the same day). Sign the XRI with the PixInsight-supported workflow once a registered identity is available.
