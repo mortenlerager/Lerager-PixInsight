@@ -10,11 +10,11 @@
             <p>Installs AstroClean 2.8.7 with English documentation and TPS Local Remove, and AlignRGB Preview 0.3 under Script &gt; Lerager.</p>
          </description>
       </package>
-      <package fileName="Lerager-SubframeReview-0.26-update.zip" sha1="a373f32b25a7283d8f6c49d1be7855894d900f28" type="script" releaseDate="20261128">
-         <title>Subframe Review 0.26</title>
+      <package fileName="Lerager-SubframeReview-0.27-update.zip" sha1="ed731b3603f58c5749a1e20426ac846268c6f800" type="script" releaseDate="20261128">
+         <title>Subframe Review 0.27</title>
          <description>
-            <p>Installs Subframe Review 0.26 with PixInsight reference documentation.</p>
+            <p>Installs Subframe Review 0.27 with native PixInsight reference documentation.</p>
          </description>
       </package>
-   </platform>
+</platform>
 </xri>
